@@ -217,6 +217,13 @@ class LightRAG:
         )
     )
 
+    use_guided_json_extraction: bool = field(
+        default=get_env_value("USE_GUIDED_JSON_EXTRACTION", False, bool)
+    )
+    """Enable structured JSON output for entity extraction using vLLM/Outlines guided generation.
+    When True, uses JSON-formatted prompts and passes guided_json schema to the LLM.
+    Requires a vLLM server with Outlines support."""
+
     # Text chunking
     # ---
 

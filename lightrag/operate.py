@@ -49,7 +49,7 @@ from lightrag.base import (
     QueryResult,
     QueryContextResult,
 )
-from lightrag.prompt import PROMPTS
+from lightrag.prompt import PROMPTS, EntityRelationExtraction
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -94,6 +94,123 @@ def _truncate_entity_identifier(
         preview,
     )
     return display_value
+
+
+async def _process_json_extraction_result(
+    result: str,
+    chunk_key: str,
+    timestamp: int,
+    file_path: str = "unknown_source",
+) -> tuple[dict, dict]:
+    """Process a JSON-formatted extraction result from guided generation (Outlines/vLLM).
+
+    Args:
+        result (str): The JSON extraction result to process
+        chunk_key (str): The chunk key for source tracking
+        timestamp (int): Timestamp for the extraction
+        file_path (str): The file path for citation
+
+    Returns:
+        tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
+    """
+    maybe_nodes = defaultdict(list)
+    maybe_edges = defaultdict(list)
+
+    try:
+        # Parse JSON result (use json_repair for robustness)
+        parsed = json_repair.loads(result)
+
+        # Process entities
+        entities = parsed.get("entities", [])
+        for entity in entities:
+            entity_name = sanitize_and_normalize_extracted_text(
+                entity.get("entity_name", ""), remove_inner_quotes=True
+            )
+            if not entity_name or not entity_name.strip():
+                continue
+
+            entity_type = sanitize_and_normalize_extracted_text(
+                entity.get("entity_type", ""), remove_inner_quotes=True
+            )
+            if not entity_type.strip():
+                continue
+            entity_type = entity_type.replace(" ", "").lower()
+
+            entity_description = sanitize_and_normalize_extracted_text(
+                entity.get("entity_description", "")
+            )
+            if not entity_description.strip():
+                continue
+
+            truncated_name = _truncate_entity_identifier(
+                entity_name,
+                DEFAULT_ENTITY_NAME_MAX_LENGTH,
+                chunk_key,
+                "Entity name",
+            )
+
+            entity_data = dict(
+                entity_name=truncated_name,
+                entity_type=entity_type,
+                description=entity_description,
+                source_id=chunk_key,
+                file_path=file_path,
+                timestamp=timestamp,
+            )
+            maybe_nodes[truncated_name].append(entity_data)
+
+        # Process relations
+        relations = parsed.get("relations", [])
+        for relation in relations:
+            source = sanitize_and_normalize_extracted_text(
+                relation.get("source_entity", ""), remove_inner_quotes=True
+            )
+            target = sanitize_and_normalize_extracted_text(
+                relation.get("target_entity", ""), remove_inner_quotes=True
+            )
+
+            if not source or not target or source == target:
+                continue
+
+            edge_keywords = sanitize_and_normalize_extracted_text(
+                relation.get("relationship_keywords", ""), remove_inner_quotes=True
+            )
+            edge_keywords = edge_keywords.replace("，", ",")
+
+            edge_description = sanitize_and_normalize_extracted_text(
+                relation.get("relationship_description", "")
+            )
+
+            truncated_source = _truncate_entity_identifier(
+                source,
+                DEFAULT_ENTITY_NAME_MAX_LENGTH,
+                chunk_key,
+                "Relation entity",
+            )
+            truncated_target = _truncate_entity_identifier(
+                target,
+                DEFAULT_ENTITY_NAME_MAX_LENGTH,
+                chunk_key,
+                "Relation entity",
+            )
+
+            relationship_data = dict(
+                src_id=truncated_source,
+                tgt_id=truncated_target,
+                weight=1.0,
+                description=edge_description,
+                keywords=edge_keywords,
+                source_id=chunk_key,
+                file_path=file_path,
+                timestamp=timestamp,
+            )
+            maybe_edges[(truncated_source, truncated_target)].append(relationship_data)
+
+    except Exception as e:
+        logger.error(f"Failed to parse JSON extraction result for {chunk_key}: {e}")
+        logger.debug(f"Raw result: {result[:500]}...")
+
+    return dict(maybe_nodes), dict(maybe_edges)
 
 
 def chunking_by_token_size(
@@ -2783,6 +2900,7 @@ async def extract_entities(
 
     use_llm_func: callable = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
+    use_guided_json = global_config.get("use_guided_json_extraction", False)
 
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
@@ -2791,24 +2909,39 @@ async def extract_entities(
         "entity_types", DEFAULT_ENTITY_TYPES
     )
 
-    examples = "\n".join(PROMPTS["entity_extraction_examples"])
+    # Prepare context based on extraction mode
+    if use_guided_json:
+        # JSON mode: use simplified prompts for guided generation
+        context_base = dict(
+            entity_types=",".join(entity_types),
+            language=language,
+        )
+        # Prepare extra_body for vLLM/Outlines guided generation
+        llm_extra_kwargs = {
+            "extra_body": {"guided_json": EntityRelationExtraction.model_json_schema()}
+        }
+        logger.info("Using guided JSON extraction mode with Outlines schema")
+    else:
+        # Standard mode: use delimiter-based prompts
+        examples = "\n".join(PROMPTS["entity_extraction_examples"])
 
-    example_context_base = dict(
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=", ".join(entity_types),
-        language=language,
-    )
-    # add example's format
-    examples = examples.format(**example_context_base)
+        example_context_base = dict(
+            tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+            completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+            entity_types=", ".join(entity_types),
+            language=language,
+        )
+        # add example's format
+        examples = examples.format(**example_context_base)
 
-    context_base = dict(
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=",".join(entity_types),
-        examples=examples,
-        language=language,
-    )
+        context_base = dict(
+            tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+            completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+            entity_types=",".join(entity_types),
+            examples=examples,
+            language=language,
+        )
+        llm_extra_kwargs = {}
 
     processed_chunks = 0
     total_chunks = len(ordered_chunks)
@@ -2831,18 +2964,26 @@ async def extract_entities(
         # Create cache keys collector for batch processing
         cache_keys_collector = []
 
-        # Get initial extraction
-        # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_system_prompt"
-        ].format(**context_base)
-        # Format user prompts with input_text for each chunk
-        entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
-            **{**context_base, "input_text": content}
-        )
-        entity_continue_extraction_user_prompt = PROMPTS[
-            "entity_continue_extraction_user_prompt"
-        ].format(**{**context_base, "input_text": content})
+        # Select prompts and processing based on extraction mode
+        if use_guided_json:
+            # JSON mode: use JSON-specific prompts
+            entity_extraction_system_prompt = PROMPTS[
+                "entity_extraction_json_system_prompt"
+            ].format(**context_base)
+            entity_extraction_user_prompt = PROMPTS[
+                "entity_extraction_json_user_prompt"
+            ].format(**{**context_base, "input_text": content})
+        else:
+            # Standard mode: use delimiter-based prompts
+            entity_extraction_system_prompt = PROMPTS[
+                "entity_extraction_system_prompt"
+            ].format(**context_base)
+            entity_extraction_user_prompt = PROMPTS[
+                "entity_extraction_user_prompt"
+            ].format(**{**context_base, "input_text": content})
+            entity_continue_extraction_user_prompt = PROMPTS[
+                "entity_continue_extraction_user_prompt"
+            ].format(**{**context_base, "input_text": content})
 
         final_result, timestamp = await use_llm_func_with_cache(
             entity_extraction_user_prompt,
@@ -2852,38 +2993,27 @@ async def extract_entities(
             cache_type="extract",
             chunk_id=chunk_key,
             cache_keys_collector=cache_keys_collector,
+            **llm_extra_kwargs,
         )
 
-        history = pack_user_ass_to_openai_messages(
-            entity_extraction_user_prompt, final_result
-        )
-
-        # Process initial extraction with file path
-        maybe_nodes, maybe_edges = await _process_extraction_result(
-            final_result,
-            chunk_key,
-            timestamp,
-            file_path,
-            tuple_delimiter=context_base["tuple_delimiter"],
-            completion_delimiter=context_base["completion_delimiter"],
-        )
-
-        # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
-        if entity_extract_max_gleaning > 0:
-            glean_result, timestamp = await use_llm_func_with_cache(
-                entity_continue_extraction_user_prompt,
-                use_llm_func,
-                system_prompt=entity_extraction_system_prompt,
-                llm_response_cache=llm_response_cache,
-                history_messages=history,
-                cache_type="extract",
-                chunk_id=chunk_key,
-                cache_keys_collector=cache_keys_collector,
+        # Process extraction result based on mode
+        if use_guided_json:
+            # JSON mode: parse structured JSON response
+            maybe_nodes, maybe_edges = await _process_json_extraction_result(
+                final_result,
+                chunk_key,
+                timestamp,
+                file_path,
+            )
+            # No gleaning in JSON mode (guided generation produces complete output)
+        else:
+            # Standard mode: parse delimiter-based response
+            history = pack_user_ass_to_openai_messages(
+                entity_extraction_user_prompt, final_result
             )
 
-            # Process gleaning result separately with file path
-            glean_nodes, glean_edges = await _process_extraction_result(
-                glean_result,
+            maybe_nodes, maybe_edges = await _process_extraction_result(
+                final_result,
                 chunk_key,
                 timestamp,
                 file_path,
@@ -2891,36 +3021,59 @@ async def extract_entities(
                 completion_delimiter=context_base["completion_delimiter"],
             )
 
-            # Merge results - compare description lengths to choose better version
-            for entity_name, glean_entities in glean_nodes.items():
-                if entity_name in maybe_nodes:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_nodes[entity_name][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(glean_entities[0].get("description", "") or "")
+            # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
+            if entity_extract_max_gleaning > 0:
+                glean_result, timestamp = await use_llm_func_with_cache(
+                    entity_continue_extraction_user_prompt,
+                    use_llm_func,
+                    system_prompt=entity_extraction_system_prompt,
+                    llm_response_cache=llm_response_cache,
+                    history_messages=history,
+                    cache_type="extract",
+                    chunk_id=chunk_key,
+                    cache_keys_collector=cache_keys_collector,
+                )
 
-                    if glean_desc_len > original_desc_len:
+                # Process gleaning result separately with file path
+                glean_nodes, glean_edges = await _process_extraction_result(
+                    glean_result,
+                    chunk_key,
+                    timestamp,
+                    file_path,
+                    tuple_delimiter=context_base["tuple_delimiter"],
+                    completion_delimiter=context_base["completion_delimiter"],
+                )
+
+                # Merge results - compare description lengths to choose better version
+                for entity_name, glean_entities in glean_nodes.items():
+                    if entity_name in maybe_nodes:
+                        # Compare description lengths and keep the better one
+                        original_desc_len = len(
+                            maybe_nodes[entity_name][0].get("description", "") or ""
+                        )
+                        glean_desc_len = len(glean_entities[0].get("description", "") or "")
+
+                        if glean_desc_len > original_desc_len:
+                            maybe_nodes[entity_name] = list(glean_entities)
+                        # Otherwise keep original version
+                    else:
+                        # New entity from gleaning stage
                         maybe_nodes[entity_name] = list(glean_entities)
-                    # Otherwise keep original version
-                else:
-                    # New entity from gleaning stage
-                    maybe_nodes[entity_name] = list(glean_entities)
 
-            for edge_key, glean_edges in glean_edges.items():
-                if edge_key in maybe_edges:
-                    # Compare description lengths and keep the better one
-                    original_desc_len = len(
-                        maybe_edges[edge_key][0].get("description", "") or ""
-                    )
-                    glean_desc_len = len(glean_edges[0].get("description", "") or "")
+                for edge_key, glean_edge_list in glean_edges.items():
+                    if edge_key in maybe_edges:
+                        # Compare description lengths and keep the better one
+                        original_desc_len = len(
+                            maybe_edges[edge_key][0].get("description", "") or ""
+                        )
+                        glean_desc_len = len(glean_edge_list[0].get("description", "") or "")
 
-                    if glean_desc_len > original_desc_len:
-                        maybe_edges[edge_key] = list(glean_edges)
-                    # Otherwise keep original version
-                else:
-                    # New edge from gleaning stage
-                    maybe_edges[edge_key] = list(glean_edges)
+                        if glean_desc_len > original_desc_len:
+                            maybe_edges[edge_key] = list(glean_edge_list)
+                        # Otherwise keep original version
+                    else:
+                        # New edge from gleaning stage
+                        maybe_edges[edge_key] = list(glean_edge_list)
 
         # Batch update chunk's llm_cache_list with all collected cache keys
         if cache_keys_collector and text_chunks_storage:

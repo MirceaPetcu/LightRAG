@@ -1,5 +1,33 @@
 from __future__ import annotations
-from typing import Any
+from typing import Any, List
+from pydantic import BaseModel, Field
+
+
+class Entity(BaseModel):
+    """Schema for a single extracted entity."""
+    entity_name: str = Field(..., description="Name of the entity in title case")
+    entity_type: str = Field(..., description="Category of the entity (e.g., person, organization, location, event, concept, etc.)")
+    entity_description: str = Field(..., description="Concise description of the entity's attributes and activities")
+
+
+class Relation(BaseModel):
+    """Schema for a single extracted relationship between entities."""
+    source_entity: str = Field(..., description="Name of the source entity in title case")
+    target_entity: str = Field(..., description="Name of the target entity in title case")
+    relationship_keywords: str = Field(..., description="Comma-separated high-level keywords summarizing the relationship")
+    relationship_description: str = Field(..., description="Concise explanation of the relationship between source and target entities")
+
+
+class EntityRelationExtraction(BaseModel):
+    """Schema for the complete entity and relation extraction response."""
+    entities: List[Entity] = Field(default_factory=list, description="List of extracted entities")
+    relations: List[Relation] = Field(default_factory=list, description="List of extracted relationships")
+
+
+class Keywords(BaseModel):
+    """Schema for extracted keywords from a query."""
+    high_level_keywords: List[str] = Field(default_factory=list, description="Overarching concepts or themes capturing user's core intent")
+    low_level_keywords: List[str] = Field(default_factory=list, description="Specific entities, proper nouns, technical jargon, or concrete items")
 
 
 PROMPTS: dict[str, Any] = {}
@@ -181,6 +209,99 @@ relation{tuple_delimiter}Noah Carter{tuple_delimiter}World Athletics Championshi
 
 """,
 ]
+
+# =============================================================================
+# JSON-STRUCTURED PROMPTS FOR USE WITH OUTLINES/VLLM GUIDED GENERATION
+# These prompts request JSON output compatible with the Pydantic models defined above
+# =============================================================================
+
+PROMPTS["entity_extraction_json_system_prompt"] = """---Role---
+You are a Knowledge Graph Specialist responsible for extracting entities and relationships from the input text.
+
+---Instructions---
+1.  **Entity Extraction:**
+    *   Identify clearly defined and meaningful entities in the input text.
+    *   For each entity, extract:
+        *   `entity_name`: The name of the entity in title case. Ensure consistent naming.
+        *   `entity_type`: Categorize using one of: {entity_types}. If none apply, use "Other".
+        *   `entity_description`: A concise description based solely on the input text.
+
+2.  **Relationship Extraction:**
+    *   Identify direct, clearly stated relationships between extracted entities.
+    *   Decompose N-ary relationships into binary pairs.
+    *   For each relationship, extract:
+        *   `source_entity`: Name of the source entity (title case, consistent with entity extraction).
+        *   `target_entity`: Name of the target entity (title case, consistent with entity extraction).
+        *   `relationship_keywords`: Comma-separated keywords summarizing the relationship nature.
+        *   `relationship_description`: Concise explanation of the relationship.
+
+3.  **Output Format:**
+    *   Return a JSON object with two arrays: "entities" and "relations".
+    *   Entities first, then relationships.
+    *   Prioritize the most significant relationships.
+
+4.  **Guidelines:**
+    *   Write in third person, avoid pronouns.
+    *   Output must be in {language}. Keep proper nouns in original language if no proper translation exists.
+    *   All entity and relation names must be consistent throughout.
+"""
+
+PROMPTS["entity_extraction_json_user_prompt"] = """---Task---
+Extract entities and relationships from the input text in Data to be Processed below.
+
+---Instructions---
+1.  **Strict Adherence to Format:** Return a valid JSON object with two arrays: "entities" and "relations".
+2.  **Output Content Only:** Output *only* the JSON object. Do not include any introductory or concluding remarks, explanations, or additional text before or after the JSON.
+3.  **Output Language:** Ensure the output language is {language}. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
+
+---Data to be Processed---
+<Entity_types>
+[{entity_types}]
+
+<Input Text>
+```
+{input_text}
+```
+
+<Output>"""
+
+PROMPTS["entity_extraction_json_examples"] = [
+    {
+        "input": "while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.",
+        "output": {
+            "entities": [
+                {"entity_name": "Alex", "entity_type": "person", "entity_description": "Alex is a character who experiences frustration and is observant of the dynamics among other characters."},
+                {"entity_name": "Taylor", "entity_type": "person", "entity_description": "Taylor is portrayed with authoritarian certainty, influencing the dynamics among other characters."},
+                {"entity_name": "Jordan", "entity_type": "person", "entity_description": "Jordan shares a commitment to discovery with Alex."},
+                {"entity_name": "Cruz", "entity_type": "person", "entity_description": "Cruz is associated with a vision of control and order."}
+            ],
+            "relations": [
+                {"source_entity": "Alex", "target_entity": "Taylor", "relationship_keywords": "power dynamics, observation", "relationship_description": "Alex observes Taylor's authoritarian behavior."},
+                {"source_entity": "Alex", "target_entity": "Jordan", "relationship_keywords": "shared goals, rebellion", "relationship_description": "Alex and Jordan share a commitment to discovery, contrasting with Cruz's vision."},
+                {"source_entity": "Jordan", "target_entity": "Cruz", "relationship_keywords": "ideological conflict, rebellion", "relationship_description": "Jordan's commitment to discovery is in rebellion against Cruz's vision of control."}
+            ]
+        }
+    }
+]
+
+PROMPTS["keywords_extraction_json_system_prompt"] = """You are an expert keyword extractor for a Retrieval-Augmented Generation (RAG) system.
+
+Given a user query, extract two types of keywords:
+1. **high_level_keywords**: Overarching concepts or themes capturing the user's core intent.
+2. **low_level_keywords**: Specific entities, proper nouns, technical jargon, or concrete items.
+
+Guidelines:
+- Keywords must be derived from the user query.
+- Prefer multi-word phrases when they represent a single concept.
+- For vague or nonsensical queries, return empty lists.
+- Output must be in {language}. Keep proper nouns in original language.
+"""
+
+PROMPTS["keywords_extraction_json_user_prompt"] = """Extract keywords from this query:
+
+Query: {query}
+
+Return a JSON object with "high_level_keywords" and "low_level_keywords" arrays."""
 
 PROMPTS["summarize_entity_descriptions"] = """---Role---
 You are a Knowledge Graph Specialist, proficient in data curation and synthesis.

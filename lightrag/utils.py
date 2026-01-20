@@ -1943,6 +1943,7 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    **llm_kwargs,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -1961,6 +1962,9 @@ async def use_llm_func_with_cache(
         chunk_id: Chunk identifier to store in cache
         text_chunks_storage: Text chunks storage to update llm_cache_list
         cache_keys_collector: Optional list to collect cache keys for batch processing
+        **llm_kwargs: Additional keyword arguments to pass to the LLM function.
+            This supports passing extra_body for vLLM/Outlines guided generation,
+            e.g., extra_body={"guided_json": schema} for structured JSON output.
 
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
@@ -2020,7 +2024,7 @@ async def use_llm_func_with_cache(
         statistic_data["llm_call"] += 1
 
         # Call LLM with sanitized input
-        kwargs = {}
+        kwargs = {**llm_kwargs}  # Include additional kwargs (e.g., extra_body for Outlines)
         if safe_history_messages:
             kwargs["history_messages"] = safe_history_messages
         if max_tokens is not None:
@@ -2054,7 +2058,7 @@ async def use_llm_func_with_cache(
         return res, current_timestamp
 
     # When cache is disabled, directly call LLM with sanitized input
-    kwargs = {}
+    kwargs = {**llm_kwargs}  # Include additional kwargs (e.g., extra_body for Outlines)
     if safe_history_messages:
         kwargs["history_messages"] = safe_history_messages
     if max_tokens is not None:
